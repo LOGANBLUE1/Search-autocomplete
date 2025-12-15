@@ -7,6 +7,9 @@ import com.example.demo.trie.TrieService;
 import com.example.demo.trie.WordFreq;
 import jakarta.annotation.PostConstruct;
 import org.bson.types.ObjectId;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -17,6 +20,9 @@ public class TrieNodeService {
     private int count = 0;
     private final TrieNodeRepository repo;
     private TrieService trieService;
+
+    @Value("${mongodb.root-node}")
+    private String rootNodeId;
 
     public TrieNodeService(TrieNodeRepository repo) {
         this.repo = repo;
@@ -89,17 +95,24 @@ public class TrieNodeService {
         return res.getId();
     }
 
+    @Cacheable(value = "searchCache", key = "#prefix")
     public List<String> suggest(String prefix) {
-        var listWithWordFreq =  trieService.suggest(prefix);
+        var listWithWordFreq = trieService.suggest(prefix);
         return listWithWordFreq.stream()
                 .map(WordFreq::getWord)
                 .toList();
     }
+
+    @CacheEvict(value = "searchCache", allEntries = true)
+    private Node loadTrieFromDb() {
+        ObjectId rootId = new ObjectId(this.rootNodeId);
+        return loadNodeFromDb(rootId);
+    }
+
     @PostConstruct
     public void init() {
-        ObjectId rootId = new ObjectId("693d6d2750193271499cd232");
         System.out.println("Loading trie from DB...");
-        var root = loadNodeFromDb(rootId);
+        var root = loadTrieFromDb();
         System.out.println("Total nodes loaded from DB: " + this.count);
 //        this.trieRoot = root;
         trieService = new TrieService(root);
