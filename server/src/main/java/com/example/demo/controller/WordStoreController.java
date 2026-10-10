@@ -11,8 +11,9 @@ import org.springframework.web.bind.annotation.*;
 public class WordStoreController {
     @Autowired
     private WordService service;
+
     @PostMapping("")
     public ResponseEntity<?> storeWord(@RequestParam String word) {
-        return ApiResponse.created(service.insert(word));
+        return ApiResponse.created(service.recordSearch(word));
     }
 }

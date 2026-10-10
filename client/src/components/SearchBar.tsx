@@ -8,14 +8,14 @@ function SearchBar() {
     const abortRef = useRef<AbortController | null>(null)
     const debounceRef = useRef<number | null>(null)
 
-    const search = async () => {
+    const suggest = async (q: string) => {
         abortRef.current?.abort()
         abortRef.current = new AbortController()
 
         try {
             setLoading(true)
             const res = await fetch(
-                `http://localhost:8080/query?query=${encodeURIComponent(query)}`,
+                `http://localhost:8080/query?query=${encodeURIComponent(q)}`,
                 { signal: abortRef.current.signal }
             )
 
@@ -32,13 +32,26 @@ function SearchBar() {
         }
     }
 
+    const recordCompletedSearch = async (q: string) => {
+        const trimmed = q.trim()
+        if (!trimmed) return
+        try {
+            await fetch(
+                `http://localhost:8080/query/record?query=${encodeURIComponent(trimmed)}`,
+                { method: "POST" }
+            )
+        } catch (err) {
+            console.error(err)
+        }
+    }
+
     useEffect(() => {
         if (debounceRef.current) {
             clearTimeout(debounceRef.current)
         }
 
         debounceRef.current = window.setTimeout(() => {
-            search()
+            suggest(query)
         }, 200)
 
         return () => {
@@ -51,8 +64,15 @@ function SearchBar() {
             if (debounceRef.current) {
                 clearTimeout(debounceRef.current)
             }
-            search()
+            suggest(query)
+            recordCompletedSearch(query)
         }
+    }
+
+    const onSelectSuggestion = (item: string) => {
+        setQuery(item)
+        setResults([])
+        recordCompletedSearch(item)
     }
 
     return (
@@ -68,7 +88,10 @@ function SearchBar() {
                 />
 
                 <button
-                    onClick={search}
+                    onClick={() => {
+                        suggest(query)
+                        recordCompletedSearch(query)
+                    }}
                     disabled={loading}
                     className="rounded bg-blue-600 px-4 py-2 text-white hover:bg-blue-700 disabled:opacity-50"
                 >
@@ -86,6 +109,7 @@ function SearchBar() {
                         <li
                             key={idx}
                             className="px-3 py-2 hover:bg-gray-100 cursor-pointer"
+                            onClick={() => onSelectSuggestion(item)}
                         >
                             {item}
                         </li>
