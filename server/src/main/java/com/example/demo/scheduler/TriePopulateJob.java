@@ -1,29 +1,28 @@
 package com.example.demo.scheduler;
 
-import com.example.demo.trie.TrieInterface;
+import com.example.demo.service.TrieNodeService;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 @Component
 public class TriePopulateJob {
 
-//    private final TrieInterface trie;
-//
-//    public TriePopulateJob(TrieInterface trie) {
-//        this.trie = trie;
-//    }
+    private final TrieNodeService trieNodeService;
 
-//
-//        0 0 2 ? * MON
-//    │ │ │ │ │ └─ Monday
-//    │ │ │ │ └── every month
-//    │ │ │ └──── day-of-month ignored
-//    │ │ └────── 2 AM
-//    │ └──────── 0 minutes
-//    └────────── 0 seconds
+    public TriePopulateJob(TrieNodeService trieNodeService) {
+        this.trieNodeService = trieNodeService;
+    }
 
-    @Scheduled(cron = "0 0 2 ? * MON") // every Monday at 2 AM
+    /**
+     * Every Monday at 2 AM: apply searches received since the last build
+     * into the in-memory trie (incremental top-K), persist dirty nodes, evict cache.
+     *
+     * Cron: 0 0 2 ? * MON
+     */
+    @Scheduled(cron = "0 0 2 ? * MON")
     public void populateTrieWeekly() {
-
+        System.out.println("Weekly trie delta apply starting...");
+        int applied = trieNodeService.applyWeeklyDelta();
+        System.out.println("Weekly trie delta apply finished. Words applied: " + applied);
     }
 }

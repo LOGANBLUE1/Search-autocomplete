@@ -1,8 +1,11 @@
 package com.example.demo.service;
 
-import com.example.demo.models.TrieNode;
-import com.example.demo.repository.TrieNodeRepository;
 import com.example.demo.dto.Node;
+import com.example.demo.models.TrieBuildState;
+import com.example.demo.models.TrieNode;
+import com.example.demo.models.Word;
+import com.example.demo.repository.TrieBuildStateRepository;
+import com.example.demo.repository.TrieNodeRepository;
 import com.example.demo.trie.TrieService;
 import com.example.demo.trie.WordFreq;
 import jakarta.annotation.PostConstruct;
@@ -12,20 +15,31 @@ import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 @Service
 public class TrieNodeService {
     private int count = 0;
     private final TrieNodeRepository repo;
+    private final TrieBuildStateRepository buildStateRepository;
+    private final WordService wordService;
     private TrieService trieService;
 
     @Value("${mongodb.root-node}")
     private String rootNodeId;
 
-    public TrieNodeService(TrieNodeRepository repo) {
+    public TrieNodeService(
+            TrieNodeRepository repo,
+            TrieBuildStateRepository buildStateRepository,
+            WordService wordService) {
         this.repo = repo;
+        this.buildStateRepository = buildStateRepository;
+        this.wordService = wordService;
     }
 
     public TrieNode findById(ObjectId id) {
@@ -36,23 +50,42 @@ public class TrieNodeService {
         return repo.save(node);
     }
 
-    public TrieNode deleteAll() {
-        repo.deleteAll();
-        return null;
+    public TrieService getTrieService() {
+        return trieService;
     }
 
-    private Node loadNodeFromDb(ObjectId id) {
-        TrieNode trieNode = this.findById(id);
-        if (trieNode == null) return null;
+    /**
+     * Bulk-load all trie nodes, then wire children in memory (no per-node round trips).
+     */
+    private Node loadTrieBulk(ObjectId rootId) {
+        List<TrieNode> all = repo.findAll();
+        Map<ObjectId, TrieNode> byId = new HashMap<>(all.size() * 2);
+        for (TrieNode tn : all) {
+            byId.put(tn.getId(), tn);
+        }
+        this.count = 0;
+        return buildNodeFromMap(rootId, byId);
+    }
+
+    private Node buildNodeFromMap(ObjectId id, Map<ObjectId, TrieNode> byId) {
+        if (id == null) {
+            return null;
+        }
+        TrieNode trieNode = byId.get(id);
+        if (trieNode == null) {
+            return null;
+        }
         this.count++;
         Node node = new Node(trieNode);
 
-        var topDocs = trieNode.getTopKFreq();
+        List<WordFreq> topDocs = trieNode.getTopKFreq();
         if (topDocs != null) {
-            node.topKFreq = new ArrayList<>();
-            for (var td : topDocs) {
+            node.topKFreq = new ArrayList<>(topDocs.size());
+            for (WordFreq td : topDocs) {
                 node.topKFreq.add(new WordFreq(td.getWord(), td.getFreq()));
             }
+        } else {
+            node.topKFreq = new ArrayList<>();
         }
 
         List<ObjectId> childIds = trieNode.getChildren();
@@ -60,18 +93,52 @@ public class TrieNodeService {
             for (int i = 0; i < childIds.size() && i < 26; i++) {
                 ObjectId childId = childIds.get(i);
                 if (childId != null) {
-                    node.children[i] = loadNodeFromDb(childId);
-                } else {
-                    node.children[i] = null;
+                    node.children[i] = buildNodeFromMap(childId, byId);
                 }
             }
         }
-
         return node;
     }
 
+    /**
+     * Persist only dirty nodes (and newly created ones). Bottom-up so child ObjectIds exist.
+     */
+    public ObjectId persistDirtyNodes(Node node) {
+        if (node == null) {
+            return null;
+        }
+
+        List<ObjectId> childrenIds = new ArrayList<>(Collections.nCopies(26, null));
+        for (int i = 0; i < 26; i++) {
+            Node child = node.children[i];
+            if (child != null) {
+                childrenIds.set(i, persistDirtyNodes(child));
+            }
+        }
+
+        if (node.dirty || node.id == null) {
+            TrieNode trieNode = new TrieNode();
+            if (node.id != null) {
+                trieNode.setId(node.id);
+            }
+            trieNode.setTerminal(node.isTerminal);
+            trieNode.setFreq(node.freq);
+            trieNode.setWord(node.word);
+            trieNode.setTopKFreq(node.topKFreq);
+            trieNode.setChildren(childrenIds);
+
+            TrieNode saved = this.insert(trieNode);
+            node.id = saved.getId();
+            node.dirty = false;
+        }
+        return node.id;
+    }
+
+    /** Full rewrite helper (rare); prefer {@link #persistDirtyNodes(Node)}. */
     public ObjectId insertNode(Node node) {
-        if (node == null) return null;
+        if (node == null) {
+            return null;
+        }
 
         List<ObjectId> childrenIds = new ArrayList<>(26);
         for (int i = 0; i < 26; i++) {
@@ -79,8 +146,7 @@ public class TrieNodeService {
             if (child == null) {
                 childrenIds.add(null);
             } else {
-                ObjectId childId = insertNode(child);
-                childrenIds.add(childId);
+                childrenIds.add(insertNode(child));
             }
         }
 
@@ -91,35 +157,96 @@ public class TrieNodeService {
         trieNode.setTopKFreq(node.topKFreq);
         trieNode.setChildren(childrenIds);
 
-        var res = this.insert(trieNode);
-        return res.getId();
+        return this.insert(trieNode).getId();
     }
 
     @Cacheable(value = "searchCache", key = "#prefix")
     public List<String> suggest(String prefix) {
-        var listWithWordFreq = trieService.suggest(prefix);
-        return listWithWordFreq.stream()
+        if (trieService == null) {
+            return List.of();
+        }
+        return trieService.suggest(prefix).stream()
                 .map(WordFreq::getWord)
                 .toList();
     }
 
     @CacheEvict(value = "searchCache", allEntries = true)
-    private Node loadTrieFromDb() {
-        ObjectId rootId = new ObjectId(this.rootNodeId);
-        return loadNodeFromDb(rootId);
+    public void evictSearchCache() {
+        // annotation-driven eviction
+    }
+
+    /**
+     * Apply words updated since lastBuildAt into the in-memory trie with incremental top-K,
+     * persist dirty nodes, update build state, and evict Redis cache.
+     */
+    @CacheEvict(value = "searchCache", allEntries = true)
+    public synchronized int applyWeeklyDelta() {
+        if (trieService == null) {
+            return 0;
+        }
+
+        TrieBuildState state = buildStateRepository
+                .findById(TrieBuildState.SINGLETON_ID)
+                .orElseGet(() -> new TrieBuildState(Instant.EPOCH, rootNodeId));
+
+        List<Word> pending = wordService.findPendingDelta();
+
+        int applied = 0;
+        for (Word word : pending) {
+            int delta = word.pendingDelta();
+            if (delta <= 0) {
+                continue;
+            }
+            trieService.insert(word.getWord(), delta);
+            wordService.markApplied(word);
+            applied++;
+        }
+
+        Node root = trieService.getRoot();
+        ObjectId newRootId = persistDirtyNodes(root);
+        if (newRootId != null) {
+            this.rootNodeId = newRootId.toHexString();
+        }
+
+        Instant now = Instant.now();
+        state.setLastBuildAt(now);
+        state.setRootNodeId(this.rootNodeId);
+        buildStateRepository.save(state);
+
+        return applied;
     }
 
     @PostConstruct
     public void init() {
-        System.out.println("Loading trie from DB...");
-        var root = loadTrieFromDb();
+        resolveRootNodeId();
+        System.out.println("Loading trie from DB (bulk)...");
+        ObjectId rootId = new ObjectId(this.rootNodeId);
+        Node root = loadTrieBulk(rootId);
+        if (root == null) {
+            System.out.println("Root node not found; starting with empty trie");
+            root = new Node();
+            root.dirty = true;
+        }
         System.out.println("Total nodes loaded from DB: " + this.count);
-//        this.trieRoot = root;
-        trieService = new TrieService(root);
-        System.out.println("Populated the trie");
-//        System.out.println("Inserting trie back to DB...");
-//        this.deleteAll();
-//        this.insertNode(root);
-//        System.out.println("Trie insertion complete.");
+
+        // Skip dfsCollect — topKFreq already persisted on each node
+        trieService = new TrieService(root, false);
+        System.out.println("Trie ready (no full top-K rebuild)");
+
+        ensureBuildState();
+    }
+
+    private void resolveRootNodeId() {
+        buildStateRepository.findById(TrieBuildState.SINGLETON_ID).ifPresent(state -> {
+            if (state.getRootNodeId() != null && !state.getRootNodeId().isBlank()) {
+                this.rootNodeId = state.getRootNodeId();
+            }
+        });
+    }
+
+    private void ensureBuildState() {
+        if (!buildStateRepository.existsById(TrieBuildState.SINGLETON_ID)) {
+            buildStateRepository.save(new TrieBuildState(Instant.EPOCH, rootNodeId));
+        }
     }
 }
